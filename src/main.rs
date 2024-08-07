@@ -1,8 +1,13 @@
 use futures::StreamExt;
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
-use std::str::FromStr;
-use web3::ethabi::{Address, Int, Log};
+use std::{collections::HashMap, str::FromStr};
+use web3::{
+    ethabi::{Address, Event, Int, Log},
+    transports::WebSocket,
+    types::{H160, H256, U64},
+    Web3,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -23,18 +28,114 @@ async fn main() -> Result<(), anyhow::Error> {
     let swap_event_signature = swap_event.signature();
 
     let mut block_stream = web3.eth_subscribe().subscribe_new_heads().await?;
+    let mut data: HashMap<U64, BlockData> = HashMap::new();
 
     while let Some(Ok(block)) = block_stream.next().await {
-        let swap_logs_in_block = web3
-            .eth()
-            .logs(
-                web3::types::FilterBuilder::default()
-                    .block_hash(block.hash.unwrap())
-                    .address(vec![contract_address])
-                    .topics(Some(vec![swap_event_signature]), None, None, None)
-                    .build(),
-            )
-            .await?;
+        let block_number = block.number.expect("Error getting block number!");
+        let block_hash = block.hash.expect("Error getting block hash!");
+
+        println!("current block: {}", block_number);
+
+        read_and_add_logs(
+            web3.clone(),
+            block_hash,
+            contract_address,
+            swap_event_signature,
+            &mut data,
+            block_number,
+        )
+        .await?;
+
+        // Showing blocks N - 5 to protect against reorganisation
+        show(
+            web3.clone(),
+            contract_address,
+            swap_event,
+            swap_event_signature,
+            &mut data,
+            block_number - 5,
+        )
+        .await?;
+
+        check_for_reorganization(
+            &mut data,
+            block_number,
+            web3.clone(),
+            contract_address,
+            swap_event_signature,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+struct BlockData {
+    block_hash: H256,
+    log: Vec<web3::types::Log>,
+}
+
+async fn read_logs(
+    web3: Web3<WebSocket>,
+    block_hash: H256,
+    contract_address: H160,
+    swap_event_signature: H256,
+) -> Result<Vec<web3::types::Log>, anyhow::Error> {
+    let logs = web3
+        .eth()
+        .logs(
+            web3::types::FilterBuilder::default()
+                .block_hash(block_hash)
+                .address(vec![contract_address])
+                .topics(Some(vec![swap_event_signature]), None, None, None)
+                .build(),
+        )
+        .await?;
+
+    Ok(logs)
+}
+
+async fn read_and_add_logs(
+    web3: Web3<WebSocket>,
+    block_hash: H256,
+    contract_address: H160,
+    swap_event_signature: H256,
+    data: &mut HashMap<U64, BlockData>,
+    block_number: U64,
+) -> Result<Vec<web3::types::Log>, anyhow::Error> {
+    let logs = read_logs(web3, block_hash, contract_address, swap_event_signature).await?;
+
+    if !logs.is_empty() {
+        data.insert(
+            block_number,
+            BlockData {
+                block_hash,
+                log: logs.clone(),
+            },
+        );
+    }
+
+    Ok(logs)
+}
+
+async fn show(
+    web3: Web3<WebSocket>,
+    contract_address: H160,
+    swap_event: &Event,
+    swap_event_signature: H256,
+    data: &mut HashMap<U64, BlockData>,
+    block_number: U64,
+) -> Result<(), anyhow::Error> {
+    if let Some(block_data) = data.get(&block_number) {
+        println!("show block: {}", block_number);
+
+        let swap_logs_in_block = read_logs(
+            web3,
+            block_data.block_hash,
+            contract_address,
+            swap_event_signature,
+        )
+        .await?;
 
         for log in swap_logs_in_block {
             let parsed_log = swap_event.parse_log(web3::ethabi::RawLog {
@@ -43,7 +144,7 @@ async fn main() -> Result<(), anyhow::Error> {
             })?;
             println!("{:#?}", get_output_field(parsed_log));
         }
-    }
+    };
 
     Ok(())
 }
@@ -100,4 +201,36 @@ fn twos_complement(value: &Int) -> BigInt {
 
     // Calculate two's complement
     &two_power - big_int_value
+}
+
+async fn check_for_reorganization(
+    data: &mut HashMap<U64, BlockData>,
+    block_number: U64,
+    web3: Web3<WebSocket>,
+    contract_address: H160,
+    swap_event_signature: H256,
+) -> Result<(), anyhow::Error> {
+    for (block, block_data) in data {
+        // Skipping for first N + 5 depth
+        let depth_opt = block_number.checked_sub(block + 5);
+
+        if let Some(depth) = depth_opt {
+            if depth > U64::zero() {
+                let logs = read_logs(
+                    web3.clone(),
+                    block_data.block_hash,
+                    contract_address,
+                    swap_event_signature,
+                )
+                .await?;
+
+                anyhow::ensure!(
+                    logs.eq(&block_data.log),
+                    "Error: Reorganization happen after depth 5!"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
